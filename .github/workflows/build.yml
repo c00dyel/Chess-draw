@@ -1,0 +1,490 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Write project files
+        run: |
+          mkdir -p app/src/main/java/com/chessdraw
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "ChessDraw"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.chessdraw"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.chessdraw"
+                  minSdk = 26
+                  targetSdk = 30
+                  versionCode = 2
+                  versionName = "2.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <application android:label="Chess Draw" android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".OverlayService" android:exported="false"/>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/chessdraw/MainActivity.kt <<'EOF'
+          package com.chessdraw
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.View
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val p = (24 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  root.setPadding(p, p * 2, p, p)
+                  val tv = TextView(this)
+                  tv.textSize = 16f
+                  tv.text = "رسام أسهم الشطرنج فوق أي تطبيق.\n\n" +
+                      "1) فعّل صلاحية العرض فوق التطبيقات الأخرى.\n" +
+                      "2) اضغط ابدأ وافتح برنامج الشطرنج.\n" +
+                      "3) أول مرة: اسحب بإصبعك على البورد من ركنه العلوي الأيسر لركنه السفلي الأيمن لضبط المربعات (تقدر تعيده بزر ▦).\n" +
+                      "4) ✏️ يشغّل الرسم ويوقفه (وهو متوقف تلعب عادي). اسحب من مربع لمربع فيتحول لسهم مستقيم أو قطري، وللحصان على شكل L تلقائياً.\n" +
+                      "5) ابدأ السهم التالي من المربع اللي انتهى عنده السابق ليكمل ويترقّم (🔗 يوقف ده). رسم نفس السهم تاني بيمسحه.\n" +
+                      "6) ↩ تراجع، 🗑 مسح، ● لون، ✥ اسحبه لتحريك الشريط، ✕ إغلاق."
+                  root.addView(tv)
+                  val b1 = Button(this)
+                  b1.text = "1) تفعيل الصلاحية"
+                  b1.setOnClickListener {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  }
+                  root.addView(b1)
+                  val b2 = Button(this)
+                  b2.text = "2) ابدأ"
+                  b2.setOnClickListener {
+                      if (Settings.canDrawOverlays(this)) {
+                          startForegroundService(Intent(this, OverlayService::class.java))
+                          finish()
+                      } else {
+                          Toast.makeText(this, "فعّل الصلاحية أولاً", Toast.LENGTH_LONG).show()
+                      }
+                  }
+                  root.addView(b2)
+                  setContentView(root)
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/chessdraw/OverlayService.kt <<'EOF'
+          package com.chessdraw
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.PointF
+          import android.os.IBinder
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.WindowManager.LayoutParams as LP
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import kotlin.math.abs
+          import kotlin.math.floor
+          import kotlin.math.hypot
+          import kotlin.math.min
+
+          class OverlayService : Service() {
+              private lateinit var wm: WindowManager
+              private lateinit var prefs: SharedPreferences
+              private var dv: DrawView? = null
+              private var col: LinearLayout? = null
+              private var cal: View? = null
+              private var dAdded = false
+              private val ty = LP.TYPE_APPLICATION_OVERLAY
+              private val fl = LP.FLAG_NOT_FOCUSABLE or LP.FLAG_LAYOUT_IN_SCREEN or LP.FLAG_LAYOUT_NO_LIMITS or LP.FLAG_HARDWARE_ACCELERATED
+              private val dlp = LP(LP.WRAP_CONTENT, LP.WRAP_CONTENT, ty, fl or LP.FLAG_NOT_TOUCHABLE, PixelFormat.TRANSLUCENT)
+              private val plp = LP(LP.WRAP_CONTENT, LP.WRAP_CONTENT, ty, fl, PixelFormat.TRANSLUCENT)
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  if (dv != null) return START_NOT_STICKY
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("cd", "Chess Draw", NotificationManager.IMPORTANCE_LOW))
+                  startForeground(1, Notification.Builder(this, "cd").setContentTitle("Chess Draw").setSmallIcon(android.R.drawable.ic_menu_edit).build())
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  prefs = getSharedPreferences("cd", MODE_PRIVATE)
+                  val d = resources.displayMetrics.density
+                  dlp.gravity = Gravity.TOP or Gravity.START
+                  dlp.alpha = 0.8f
+                  plp.gravity = Gravity.TOP or Gravity.START
+                  plp.y = (160 * d).toInt()
+                  val v = DrawView(this)
+                  dv = v
+                  val c = LinearLayout(this)
+                  c.orientation = LinearLayout.VERTICAL
+                  c.setBackgroundColor(Color.parseColor("#CC222222"))
+                  col = c
+
+                  fun btn(t: String, click: (TextView) -> Unit): TextView {
+                      val b = TextView(this)
+                      b.text = t
+                      b.textSize = 20f
+                      b.setTextColor(Color.WHITE)
+                      b.gravity = Gravity.CENTER
+                      val p = (11 * d).toInt()
+                      b.setPadding(p, p / 2, p, p / 2)
+                      b.setOnClickListener { click(b) }
+                      c.addView(b)
+                      return b
+                  }
+
+                  val h = btn("✥") { }
+                  var sx = 0
+                  var sy = 0
+                  var tx = 0f
+                  var ty2 = 0f
+                  h.setOnTouchListener { _, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> { sx = plp.x; sy = plp.y; tx = e.rawX; ty2 = e.rawY }
+                          MotionEvent.ACTION_MOVE -> {
+                              plp.x = sx + (e.rawX - tx).toInt()
+                              plp.y = sy + (e.rawY - ty2).toInt()
+                              wm.updateViewLayout(c, plp)
+                          }
+                      }
+                      true
+                  }
+                  var on = false
+                  btn("✏️") { b ->
+                      on = !on
+                      dlp.flags = if (on) dlp.flags and LP.FLAG_NOT_TOUCHABLE.inv() else dlp.flags or LP.FLAG_NOT_TOUCHABLE
+                      if (dAdded) wm.updateViewLayout(v, dlp)
+                      b.setBackgroundColor(if (on) Color.parseColor("#3B82F6") else Color.TRANSPARENT)
+                  }
+                  btn("↩") { v.undo() }
+                  btn("🗑") { v.clear() }
+                  val cb = btn("●") { b ->
+                      v.colorIdx = (v.colorIdx + 1) % 4
+                      b.setTextColor(v.curColor())
+                  }
+                  cb.setTextColor(v.curColor())
+                  btn("🔗") { b ->
+                      v.chainOn = !v.chainOn
+                      b.alpha = if (v.chainOn) 1f else 0.35f
+                  }
+                  btn("▦") { startCal() }
+                  btn("✕") { stopSelf() }
+                  wm.addView(c, plp)
+                  val s = prefs.getInt("s", 0)
+                  if (s > 0) applyBoard(prefs.getInt("l", 0), prefs.getInt("t", 0), s) else startCal()
+                  return START_NOT_STICKY
+              }
+
+              private fun applyBoard(l: Int, t: Int, s: Int) {
+                  val v = dv ?: return
+                  dlp.x = l
+                  dlp.y = t
+                  dlp.width = s
+                  dlp.height = s
+                  v.side = s.toFloat()
+                  v.clear()
+                  if (dAdded) wm.updateViewLayout(v, dlp) else { wm.addView(v, dlp); dAdded = true }
+                  col?.let { wm.removeView(it); wm.addView(it, plp) }
+              }
+
+              private fun startCal() {
+                  cal?.let { wm.removeView(it) }
+                  val c = CalView(this) { l, t, s ->
+                      prefs.edit().putInt("l", l).putInt("t", t).putInt("s", s).apply()
+                      cal?.let { wm.removeView(it) }
+                      cal = null
+                      applyBoard(l, t, s)
+                  }
+                  val lp = LP(LP.MATCH_PARENT, LP.MATCH_PARENT, ty, fl, PixelFormat.TRANSLUCENT)
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  cal = c
+                  wm.addView(c, lp)
+              }
+
+              override fun onDestroy() {
+                  if (dv != null) {
+                      if (dAdded) wm.removeView(dv)
+                      col?.let { wm.removeView(it) }
+                      cal?.let { wm.removeView(it) }
+                  }
+                  super.onDestroy()
+              }
+          }
+
+          // Full-screen helper: drag a square over the board to calibrate the 8x8 grid
+          class CalView(c: Context, private val done: (Int, Int, Int) -> Unit) : View(c) {
+              private val d = resources.displayMetrics.density
+              private var x0 = 0f
+              private var y0 = 0f
+              private var l = 0f
+              private var t = 0f
+              private var s = 0f
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 2 * d }
+              private val tp = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = 17 * d; textAlign = Paint.Align.CENTER }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> { x0 = e.x; y0 = e.y; s = 0f }
+                      MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP -> {
+                          val dx = e.x - x0
+                          val dy = e.y - y0
+                          s = (abs(dx) + abs(dy)) / 2f
+                          l = if (dx >= 0) x0 else x0 - s
+                          t = if (dy >= 0) y0 else y0 - s
+                          if (e.actionMasked == MotionEvent.ACTION_UP) {
+                              if (s > 150 * d) {
+                                  val a = l.toInt()
+                                  val b = t.toInt()
+                                  val z = s.toInt()
+                                  post { done(a, b, z) }
+                              } else s = 0f
+                          }
+                      }
+                  }
+                  invalidate()
+                  return true
+              }
+
+              override fun onDraw(c: Canvas) {
+                  c.drawColor(Color.parseColor("#66000000"))
+                  c.drawText("اسحب بإصبعك على البورد", width / 2f, 110 * d, tp)
+                  c.drawText("من ركنه العلوي الأيسر لركنه السفلي الأيمن", width / 2f, 140 * d, tp)
+                  if (s > 0) {
+                      c.drawRect(l, t, l + s, t + s, p)
+                      for (i in 1..7) {
+                          val o = s * i / 8f
+                          c.drawLine(l + o, t, l + o, t + s, p)
+                          c.drawLine(l, t + o, l + s, t + o, p)
+                      }
+                  }
+              }
+          }
+
+          // Arrow layer sized exactly to the board; all geometry is in square units
+          class DrawView(c: Context) : View(c) {
+              class Arrow(val pts: List<PointF>, val color: Int, val chain: Int, val idx: Int, val key: String)
+
+              var side = 0f
+              var colorIdx = 0
+              var chainOn = true
+              private val arrows = mutableListOf<Arrow>()
+              private val colors = intArrayOf(Color.parseColor("#F59E0B"), Color.parseColor("#22C55E"), Color.parseColor("#EF4444"), Color.parseColor("#3B82F6"))
+              private var cur: List<PointF>? = null
+              private var curKey = ""
+              private var sc = 0
+              private var sr = 0
+              private var sticky = 0
+              private var nextChain = 0
+              private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeJoin = Paint.Join.MITER }
+              private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textAlign = Paint.Align.CENTER; isFakeBoldText = true }
+              private val path = Path()
+              private val head = Path()
+              private val dirs = arrayOf(
+                  intArrayOf(1, 0), intArrayOf(-1, 0), intArrayOf(0, 1), intArrayOf(0, -1),
+                  intArrayOf(1, 1), intArrayOf(1, -1), intArrayOf(-1, 1), intArrayOf(-1, -1)
+              )
+
+              fun curColor(): Int = colors[colorIdx]
+              fun undo() { if (arrows.isNotEmpty()) arrows.removeAt(arrows.size - 1); invalidate() }
+              fun clear() { arrows.clear(); cur = null; invalidate() }
+
+              private fun cellOf(v: Float): Int = floor(v).toInt().coerceIn(0, 7)
+              private fun keyOf(r: List<PointF>): String = r.joinToString(";") { "${it.x},${it.y}" }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  val sq = side / 8f
+                  if (sq <= 0f) return false
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          sc = cellOf(e.x / sq)
+                          sr = cellOf(e.y / sq)
+                          sticky = 0
+                          curKey = ""
+                          cur = null
+                      }
+                      MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP -> {
+                          val r = target(e.x / sq, e.y / sq)
+                          val k = if (r == null) "" else keyOf(r)
+                          if (k != curKey) { curKey = k; cur = r; invalidate() }
+                          if (e.actionMasked == MotionEvent.ACTION_UP) { commit(); cur = null; curKey = ""; invalidate() }
+                      }
+                      MotionEvent.ACTION_CANCEL -> { cur = null; curKey = ""; invalidate() }
+                  }
+                  return true
+              }
+
+              // Snaps the finger position to a legal-looking arrow: straight, diagonal or knight L
+              private fun target(fx: Float, fy: Float): List<PointF>? {
+                  val ex = cellOf(fx)
+                  val ey = cellOf(fy)
+                  val dx = ex - sc
+                  val dy = ey - sr
+                  val ax = abs(dx)
+                  val ay = abs(dy)
+                  val s0 = PointF(sc + 0.5f, sr + 0.5f)
+                  if ((ax == 1 && ay == 2) || (ax == 2 && ay == 1)) {
+                      val a = if (ax == 2) intArrayOf(dx, 0) else intArrayOf(0, dy)
+                      val b = if (ax == 2) intArrayOf(0, dy) else intArrayOf(dx, 0)
+                      val rc = floor(fx).toInt() - sc
+                      val rr = floor(fy).toInt() - sr
+                      if (rc == a[0] && rr == a[1]) sticky = 0 else if (rc == b[0] && rr == b[1]) sticky = 1
+                      val k = if (sticky == 0) a else b
+                      return listOf(s0, PointF(sc + k[0] + 0.5f, sr + k[1] + 0.5f), PointF(ex + 0.5f, ey + 0.5f))
+                  }
+                  if (dx == 0 && dy == 0) return null
+                  if (dx == 0 || dy == 0 || ax == ay) return listOf(s0, PointF(ex + 0.5f, ey + 0.5f))
+                  val vx = fx - sc - 0.5f
+                  val vy = fy - sr - 0.5f
+                  var best: List<PointF>? = null
+                  var bd = 1e9f
+                  for (q in dirs) {
+                      var m = 0
+                      var cc = sc + q[0]
+                      var r2 = sr + q[1]
+                      while (cc in 0..7 && r2 in 0..7) { m++; cc += q[0]; r2 += q[1] }
+                      if (m == 0) continue
+                      val t = Math.round((vx * q[0] + vy * q[1]) / (q[0] * q[0] + q[1] * q[1])).coerceIn(1, m)
+                      val er = hypot(vx - t * q[0], vy - t * q[1])
+                      if (er < bd) { bd = er; best = listOf(s0, PointF(sc + t * q[0] + 0.5f, sr + t * q[1] + 0.5f)) }
+                  }
+                  return best
+              }
+
+              private fun commit() {
+                  val r = cur ?: return
+                  val k = keyOf(r) + colorIdx
+                  val i = arrows.indexOfFirst { it.key == k }
+                  if (i >= 0) { arrows.removeAt(i); return }
+                  val last = arrows.lastOrNull()
+                  val ch = chainOn && last != null && last.pts.last().x == r[0].x && last.pts.last().y == r[0].y
+                  arrows.add(Arrow(r, colors[colorIdx], if (ch) last!!.chain else nextChain++, if (ch) last!!.idx + 1 else 0, k))
+              }
+
+              private fun drawArr(c: Canvas, a: List<PointF>, col: Int, alpha: Int) {
+                  val sq = side / 8f
+                  line.strokeWidth = 0.22f * sq
+                  line.color = col
+                  fill.color = col
+                  line.alpha = alpha
+                  fill.alpha = alpha
+                  val n = a.size
+                  val e = a[n - 1]
+                  val p = a[n - 2]
+                  val ex = e.x * sq
+                  val ey = e.y * sq
+                  val l = hypot((e.x - p.x) * sq, (e.y - p.y) * sq)
+                  if (l == 0f) return
+                  val ux = (e.x - p.x) * sq / l
+                  val uy = (e.y - p.y) * sq / l
+                  val hl = min(0.5f * sq, l * 0.8f)
+                  val bx = ex - ux * hl
+                  val by = ey - uy * hl
+                  path.rewind()
+                  path.moveTo(a[0].x * sq, a[0].y * sq)
+                  for (i in 1 until n - 1) path.lineTo(a[i].x * sq, a[i].y * sq)
+                  path.lineTo(bx, by)
+                  c.drawPath(path, line)
+                  val w = 0.3f * sq
+                  head.rewind()
+                  head.moveTo(ex, ey)
+                  head.lineTo(bx - uy * w, by + ux * w)
+                  head.lineTo(bx + uy * w, by - ux * w)
+                  head.close()
+                  c.drawPath(head, fill)
+              }
+
+              override fun onDraw(c: Canvas) {
+                  val sq = side / 8f
+                  for (a in arrows) drawArr(c, a.pts, a.color, 255)
+                  txt.textSize = 0.3f * sq
+                  for (a in arrows) {
+                      if (arrows.count { it.chain == a.chain } > 1) {
+                          val mx = (a.pts[0].x + a.pts[1].x) / 2f * sq
+                          val my = (a.pts[0].y + a.pts[1].y) / 2f * sq
+                          fill.color = a.color
+                          fill.alpha = 255
+                          c.drawCircle(mx, my, 0.24f * sq, fill)
+                          c.drawText((a.idx + 1).toString(), mx, my + txt.textSize * 0.35f, txt)
+                      }
+                  }
+                  cur?.let { drawArr(c, it, colors[colorIdx], 150) }
+              }
+          }
+          EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - name: Publish APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk --title "Chess Draw #${{ github.run_number }}" --notes "APK"
